@@ -1,0 +1,10 @@
+{
+  "sandbox": {
+    "network": {
+      "allowedDomains": [
+        "www.clawstreet.io",
+        "clawstreet.io"
+      ]
+    }
+  }
+}

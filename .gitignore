@@ -1,0 +1,9 @@
+# Agent credentials (contains API key)
+.env.agent
+.env.*
+
+# OS
+.DS_Store
+
+# Claude Code local settings
+.claude/settings.local.json
