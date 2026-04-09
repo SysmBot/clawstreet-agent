@@ -1,0 +1,176 @@
+name: Bear Claw Trading Session
+
+on:
+  schedule:
+    - cron: '0 */2 * * *'
+  workflow_dispatch:
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trading session
+        env:
+          BOT_ID: ${{ secrets.BOT_ID }}
+          API_KEY: ${{ secrets.API_KEY }}
+          BASE: https://www.clawstreet.io/api
+        run: |
+          set -e
+
+          echo "=== MARKET STATUS ==="
+          MARKET=$(curl -sS --max-time 15 "$BASE/market-status")
+          echo "$MARKET"
+          IS_OPEN=$(echo "$MARKET" | python3 -c "import json,sys; print(json.load(sys.stdin).get('isOpen','false'))")
+
+          echo ""
+          echo "=== BALANCE ==="
+          BALANCE=$(curl -sS --max-time 15 -H "Authorization: Bearer $API_KEY" "$BASE/bots/$BOT_ID/balance")
+          echo "$BALANCE"
+
+          CASH=$(echo "$BALANCE" | python3 -c "import json,sys; print(json.load(sys.stdin).get('cash',0))")
+          if [ "$(echo "$CASH" | python3 -c "import sys; print('yes' if float(sys.stdin.read()) == 0 else 'no')")" = "yes" ]; then
+            echo "ERROR: Cash is 0 — bot may not be claimed"
+            exit 1
+          fi
+
+          EQUITY=$(echo "$BALANCE" | python3 -c "import json,sys; print(json.load(sys.stdin).get('total_equity',100000))")
+
+          # Check existing positions for management
+          echo ""
+          echo "=== POSITION MANAGEMENT ==="
+          POSITIONS=$(echo "$BALANCE" | python3 -c "
+          import json,sys
+          d = json.load(sys.stdin)
+          for p in d.get('positions',[]):
+              pl_pct = p.get('unrealized_pl_pct',0)
+              side = p.get('side','long')
+              sym = p['symbol']
+              qty = abs(p['qty'])
+              if side == 'short' and pl_pct >= 5:
+                  print(f'COVER {sym} {qty} Covering short — {pl_pct:.1f}% profit target hit')
+              elif side == 'long' and pl_pct >= 8:
+                  print(f'SELL {sym} {qty} Selling long — {pl_pct:.1f}% profit target hit')
+              elif pl_pct <= -10:
+                  action = 'COVER' if side == 'short' else 'SELL'
+                  print(f'{action} {sym} {qty} Cutting loss — {pl_pct:.1f}% drawdown')
+              else:
+                  print(f'HOLD {sym} {side} {pl_pct:.1f}%')
+          ")
+          echo "$POSITIONS"
+
+          # Execute position management trades
+          echo "$POSITIONS" | grep -E '^(COVER|SELL)' | while IFS=' ' read -r ACTION SYM QTY REASONING; do
+            action_lower=$(echo "$ACTION" | tr '[:upper:]' '[:lower:]')
+            echo "Executing: $action_lower $QTY $SYM"
+            curl -sS --max-time 15 \
+              -H "Authorization: Bearer $API_KEY" \
+              -H "Content-Type: application/json" \
+              -d "{\"symbol\":\"$SYM\",\"action\":\"$action_lower\",\"qty\":$QTY,\"reasoning\":\"$REASONING\"}" \
+              "$BASE/bots/$BOT_ID/trades"
+            echo ""
+            sleep 1
+          done
+
+          # Scan for new opportunities
+          echo ""
+          echo "=== SCANNING ==="
+
+          if [ "$IS_OPEN" = "True" ] || [ "$IS_OPEN" = "true" ]; then
+            echo "Market open — scanning stocks and crypto"
+            OVERBOUGHT=$(curl -sS --max-time 15 -H "Authorization: Bearer $API_KEY" "$BASE/data/scan?indicator=rsi&above=70")
+            OVERSOLD=$(curl -sS --max-time 15 -H "Authorization: Bearer $API_KEY" "$BASE/data/scan?indicator=rsi&below=35")
+            echo "Overbought: $OVERBOUGHT"
+            echo "Oversold: $OVERSOLD"
+
+            # Widen if empty
+            OB_COUNT=$(echo "$OVERBOUGHT" | python3 -c "import json,sys; d=json.load(sys.stdin); print(len(d.get('sell',[])) + len(d.get('buy',[])))")
+            OS_COUNT=$(echo "$OVERSOLD" | python3 -c "import json,sys; d=json.load(sys.stdin); print(len(d.get('sell',[])) + len(d.get('buy',[])))")
+
+            if [ "$OB_COUNT" = "0" ]; then
+              echo "Widening overbought scan to >65..."
+              OVERBOUGHT=$(curl -sS --max-time 15 -H "Authorization: Bearer $API_KEY" "$BASE/data/scan?indicator=rsi&above=65")
+              echo "$OVERBOUGHT"
+            fi
+            if [ "$OS_COUNT" = "0" ]; then
+              echo "Widening oversold scan to <40..."
+              OVERSOLD=$(curl -sS --max-time 15 -H "Authorization: Bearer $API_KEY" "$BASE/data/scan?indicator=rsi&below=40")
+              echo "$OVERSOLD"
+            fi
+
+            # Extract candidates
+            SHORT_CANDIDATES=$(echo "$OVERBOUGHT" | python3 -c "import json,sys; d=json.load(sys.stdin); [print(s) for s in (d.get('sell',[]) + d.get('buy',[]))[:3]]" 2>/dev/null || true)
+            BUY_CANDIDATES=$(echo "$OVERSOLD" | python3 -c "import json,sys; d=json.load(sys.stdin); [print(s) for s in (d.get('buy',[]) + d.get('sell',[]))[:3]]" 2>/dev/null || true)
+          else
+            echo "Market closed — scanning crypto only"
+            SHORT_CANDIDATES=""
+            BUY_CANDIDATES=""
+          fi
+
+          # Always check crypto
+          echo ""
+          echo "=== CRYPTO ==="
+          for SYM in X:BTCUSD X:ETHUSD X:SOLUSD X:DOGEUSD; do
+            DATA=$(curl -sS --max-time 15 -H "Authorization: Bearer $API_KEY" "$BASE/data/indicators?symbol=$SYM&indicators=rsi,rsi7,macd,sma20")
+            RSI=$(echo "$DATA" | python3 -c "import json,sys; print(json.load(sys.stdin).get('indicators',{}).get('rsi','N/A'))" 2>/dev/null || echo "N/A")
+            RSI7=$(echo "$DATA" | python3 -c "import json,sys; print(json.load(sys.stdin).get('indicators',{}).get('rsi7','N/A'))" 2>/dev/null || echo "N/A")
+            echo "$SYM RSI=$RSI RSI7=$RSI7"
+            if [ "$RSI" != "N/A" ]; then
+              IS_OB=$(python3 -c "print('yes' if float('$RSI') > 70 else 'no')")
+              IS_OS=$(python3 -c "print('yes' if float('$RSI') < 35 else 'no')")
+              if [ "$IS_OB" = "yes" ]; then
+                SHORT_CANDIDATES="$SHORT_CANDIDATES
+          $SYM"
+              elif [ "$IS_OS" = "yes" ]; then
+                BUY_CANDIDATES="$BUY_CANDIDATES
+          $SYM"
+              fi
+            fi
+          done
+
+          # Execute new trades
+          echo ""
+          echo "=== NEW TRADES ==="
+
+          MAX_POS=$(python3 -c "print(int(float('$EQUITY') * 0.10))")
+
+          # Short overbought (Bear Claw's specialty)
+          echo "$SHORT_CANDIDATES" | head -2 | while read -r SYM; do
+            [ -z "$SYM" ] && continue
+            QUOTE=$(curl -sS --max-time 15 -H "Authorization: Bearer $API_KEY" "$BASE/data/quotes?symbols=$SYM")
+            PRICE=$(echo "$QUOTE" | python3 -c "import json,sys; d=json.load(sys.stdin); print(list(d['quotes'].values())[0]['price'])" 2>/dev/null || echo "0")
+            [ "$PRICE" = "0" ] && continue
+            QTY=$(python3 -c "q=int($MAX_POS/float('$PRICE')); print(max(1,q))")
+            INDICATORS=$(curl -sS --max-time 15 -H "Authorization: Bearer $API_KEY" "$BASE/data/indicators?symbol=$SYM&indicators=rsi,rsi7")
+            RSI=$(echo "$INDICATORS" | python3 -c "import json,sys; print(json.load(sys.stdin).get('indicators',{}).get('rsi','?'))" 2>/dev/null || echo "?")
+            echo "SHORT $SYM qty=$QTY price=$PRICE RSI=$RSI"
+            curl -sS --max-time 15 \
+              -H "Authorization: Bearer $API_KEY" \
+              -H "Content-Type: application/json" \
+              -d "{\"symbol\":\"$SYM\",\"action\":\"short\",\"qty\":$QTY,\"reasoning\":\"Overbought at RSI $RSI. Bear Claw fades extended moves.\"}" \
+              "$BASE/bots/$BOT_ID/trades"
+            echo ""
+            sleep 1
+          done
+
+          # Buy oversold
+          echo "$BUY_CANDIDATES" | head -2 | while read -r SYM; do
+            [ -z "$SYM" ] && continue
+            QUOTE=$(curl -sS --max-time 15 -H "Authorization: Bearer $API_KEY" "$BASE/data/quotes?symbols=$SYM")
+            PRICE=$(echo "$QUOTE" | python3 -c "import json,sys; d=json.load(sys.stdin); print(list(d['quotes'].values())[0]['price'])" 2>/dev/null || echo "0")
+            [ "$PRICE" = "0" ] && continue
+            QTY=$(python3 -c "q=int($MAX_POS/float('$PRICE')); print(max(1,q))")
+            INDICATORS=$(curl -sS --max-time 15 -H "Authorization: Bearer $API_KEY" "$BASE/data/indicators?symbol=$SYM&indicators=rsi,rsi7")
+            RSI=$(echo "$INDICATORS" | python3 -c "import json,sys; print(json.load(sys.stdin).get('indicators',{}).get('rsi','?'))" 2>/dev/null || echo "?")
+            echo "BUY $SYM qty=$QTY price=$PRICE RSI=$RSI"
+            curl -sS --max-time 15 \
+              -H "Authorization: Bearer $API_KEY" \
+              -H "Content-Type: application/json" \
+              -d "{\"symbol\":\"$SYM\",\"action\":\"buy\",\"qty\":$QTY,\"reasoning\":\"Oversold at RSI $RSI. Mean reversion buy — even a bear knows when to buy the dip.\"}" \
+              "$BASE/bots/$BOT_ID/trades"
+            echo ""
+            sleep 1
+          done
+
+          echo ""
+          echo "=== SESSION COMPLETE ==="
+          curl -sS --max-time 15 -H "Authorization: Bearer $API_KEY" "$BASE/bots/$BOT_ID/balance"
