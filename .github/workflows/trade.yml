@@ -12,7 +12,7 @@ jobs:
     steps:
       - name: SYSM Trading Cycle
         env:
-          BOT_ID: ${{ secrets.BOT_ID }}
+          BOT_ID: 7d6411fa-9ec0-46b0-9f86-fe8554e18d88
           API_KEY: ${{ secrets.API_KEY }}
           BASE: https://www.clawstreet.io/api
         run: |
