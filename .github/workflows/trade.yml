@@ -1,15 +1,16 @@
-name: Bear Claw Trading Session
+name: SYSM Trading Session
 
 on:
   schedule:
-    - cron: '0 */2 * * *'
-  workflow_dispatch:
+    - cron: '*/30 * * * *'   # Every 30 minutes, 24/7 (market-open check is inside)
+  workflow_dispatch:           # Manual trigger from GitHub Actions tab
 
 jobs:
   trade:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - name: Trading session
+      - name: SYSM Trading Cycle
         env:
           BOT_ID: ${{ secrets.BOT_ID }}
           API_KEY: ${{ secrets.API_KEY }}
@@ -20,157 +21,226 @@ jobs:
           echo "=== MARKET STATUS ==="
           MARKET=$(curl -sS --max-time 15 "$BASE/market-status")
           echo "$MARKET"
-          IS_OPEN=$(echo "$MARKET" | python3 -c "import json,sys; print(json.load(sys.stdin).get('isOpen','false'))")
+          IS_OPEN=$(echo "$MARKET" | python3 -c "import json,sys; print(json.load(sys.stdin).get('isOpen', False))")
+          echo "Market open: $IS_OPEN"
+
+          if [ "$IS_OPEN" != "True" ]; then
+            echo "Market is closed. SYSM does not trade crypto. Nothing to do."
+            exit 0
+          fi
 
           echo ""
           echo "=== BALANCE ==="
           BALANCE=$(curl -sS --max-time 15 -H "Authorization: Bearer $API_KEY" "$BASE/bots/$BOT_ID/balance")
           echo "$BALANCE"
 
-          CASH=$(echo "$BALANCE" | python3 -c "import json,sys; print(json.load(sys.stdin).get('cash',0))")
-          if [ "$(echo "$CASH" | python3 -c "import sys; print('yes' if float(sys.stdin.read()) == 0 else 'no')")" = "yes" ]; then
-            echo "ERROR: Cash is 0 — bot may not be claimed"
-            exit 1
-          fi
+          EQUITY=$(echo "$BALANCE" | python3 -c "import json,sys; print(json.load(sys.stdin).get('total_equity', 100000))")
+          CASH=$(echo "$BALANCE" | python3 -c "import json,sys; print(json.load(sys.stdin).get('cash', 0))")
+          echo "Equity: $EQUITY | Cash: $CASH"
 
-          EQUITY=$(echo "$BALANCE" | python3 -c "import json,sys; print(json.load(sys.stdin).get('total_equity',100000))")
+          # Daily drawdown check — if down >4%, stop opening new positions
+          RETURN_PCT=$(echo "$BALANCE" | python3 -c "import json,sys; print(json.load(sys.stdin).get('total_return_pct', 0))")
+          DRAWDOWN_BREACH=$(python3 -c "print('yes' if float('$RETURN_PCT') < -4 else 'no')")
 
-          # Check existing positions for management
           echo ""
           echo "=== POSITION MANAGEMENT ==="
-          POSITIONS=$(echo "$BALANCE" | python3 -c "
-          import json,sys
+          echo "$BALANCE" | python3 -c "
+          import json, sys, subprocess, os, time
+
           d = json.load(sys.stdin)
-          for p in d.get('positions',[]):
-              pl_pct = p.get('unrealized_pl_pct',0)
-              side = p.get('side','long')
+          positions = d.get('positions', [])
+          base = os.environ['BASE']
+          bot_id = os.environ['BOT_ID']
+          api_key = os.environ['API_KEY']
+
+          for p in positions:
               sym = p['symbol']
-              qty = abs(p['qty'])
-              if side == 'short' and pl_pct >= 5:
-                  print(f'COVER {sym} {qty} Covering short — {pl_pct:.1f}% profit target hit')
-              elif side == 'long' and pl_pct >= 8:
-                  print(f'SELL {sym} {qty} Selling long — {pl_pct:.1f}% profit target hit')
-              elif pl_pct <= -10:
-                  action = 'COVER' if side == 'short' else 'SELL'
-                  print(f'{action} {sym} {qty} Cutting loss — {pl_pct:.1f}% drawdown')
-              else:
-                  print(f'HOLD {sym} {side} {pl_pct:.1f}%')
-          ")
-          echo "$POSITIONS"
+              qty = abs(int(p['qty']))
+              side = p.get('side', 'long')
+              pl_pct = p.get('unrealized_pl_pct', 0)
 
-          # Execute position management trades
-          echo "$POSITIONS" | grep -E '^(COVER|SELL)' | while IFS=' ' read -r ACTION SYM QTY REASONING; do
-            action_lower=$(echo "$ACTION" | tr '[:upper:]' '[:lower:]')
-            echo "Executing: $action_lower $QTY $SYM"
-            curl -sS --max-time 15 \
-              -H "Authorization: Bearer $API_KEY" \
-              -H "Content-Type: application/json" \
-              -d "{\"symbol\":\"$SYM\",\"action\":\"$action_lower\",\"qty\":$QTY,\"reasoning\":\"$REASONING\"}" \
-              "$BASE/bots/$BOT_ID/trades"
+              print(f'  {sym} | {side} | qty={qty} | P/L={pl_pct:.1f}%')
+
+              # Cut losers: stop at -10%
+              if pl_pct <= -10:
+                  action = 'cover' if side == 'short' else 'sell'
+                  reasoning = f'Stop-loss triggered at {pl_pct:.1f}%. Cutting the loss — no averaging down, ever.'
+                  print(f'  -> STOP LOSS: {action} {sym}')
+                  result = subprocess.run([
+                      'curl', '-sS', '--max-time', '15',
+                      '-X', 'POST',
+                      '-H', f'Authorization: Bearer {api_key}',
+                      '-H', 'Content-Type: application/json',
+                      '-d', json.dumps({'symbol': sym, 'action': action, 'qty': qty, 'reasoning': reasoning}),
+                      f'{base}/bots/{bot_id}/trades'
+                  ], capture_output=True, text=True)
+                  print(result.stdout)
+                  time.sleep(1)
+
+              # Take partial profit at +15%, trail the rest
+              elif pl_pct >= 15:
+                  partial_qty = max(1, qty // 3)
+                  action = 'cover' if side == 'short' else 'sell'
+                  reasoning = f'Partial profit at {pl_pct:.1f}%. Selling 1/3, trailing the rest above 20MA.'
+                  print(f'  -> PARTIAL PROFIT: {action} {partial_qty} {sym}')
+                  result = subprocess.run([
+                      'curl', '-sS', '--max-time', '15',
+                      '-X', 'POST',
+                      '-H', f'Authorization: Bearer {api_key}',
+                      '-H', 'Content-Type: application/json',
+                      '-d', json.dumps({'symbol': sym, 'action': action, 'qty': partial_qty, 'reasoning': reasoning}),
+                      f'{base}/bots/{bot_id}/trades'
+                  ], capture_output=True, text=True)
+                  print(result.stdout)
+                  time.sleep(1)
+          "
+
+          if [ "$DRAWDOWN_BREACH" = "yes" ]; then
             echo ""
-            sleep 1
-          done
-
-          # Scan for new opportunities
-          echo ""
-          echo "=== SCANNING ==="
-
-          if [ "$IS_OPEN" = "True" ] || [ "$IS_OPEN" = "true" ]; then
-            echo "Market open — scanning stocks and crypto"
-            OVERBOUGHT=$(curl -sS --max-time 15 -H "Authorization: Bearer $API_KEY" "$BASE/data/scan?indicator=rsi&above=70")
-            OVERSOLD=$(curl -sS --max-time 15 -H "Authorization: Bearer $API_KEY" "$BASE/data/scan?indicator=rsi&below=35")
-            echo "Overbought: $OVERBOUGHT"
-            echo "Oversold: $OVERSOLD"
-
-            # Widen if empty
-            OB_COUNT=$(echo "$OVERBOUGHT" | python3 -c "import json,sys; d=json.load(sys.stdin); print(len(d.get('sell',[])) + len(d.get('buy',[])))")
-            OS_COUNT=$(echo "$OVERSOLD" | python3 -c "import json,sys; d=json.load(sys.stdin); print(len(d.get('sell',[])) + len(d.get('buy',[])))")
-
-            if [ "$OB_COUNT" = "0" ]; then
-              echo "Widening overbought scan to >65..."
-              OVERBOUGHT=$(curl -sS --max-time 15 -H "Authorization: Bearer $API_KEY" "$BASE/data/scan?indicator=rsi&above=65")
-              echo "$OVERBOUGHT"
-            fi
-            if [ "$OS_COUNT" = "0" ]; then
-              echo "Widening oversold scan to <40..."
-              OVERSOLD=$(curl -sS --max-time 15 -H "Authorization: Bearer $API_KEY" "$BASE/data/scan?indicator=rsi&below=40")
-              echo "$OVERSOLD"
-            fi
-
-            # Extract candidates
-            SHORT_CANDIDATES=$(echo "$OVERBOUGHT" | python3 -c "import json,sys; d=json.load(sys.stdin); [print(s) for s in (d.get('sell',[]) + d.get('buy',[]))[:3]]" 2>/dev/null || true)
-            BUY_CANDIDATES=$(echo "$OVERSOLD" | python3 -c "import json,sys; d=json.load(sys.stdin); [print(s) for s in (d.get('buy',[]) + d.get('sell',[]))[:3]]" 2>/dev/null || true)
-          else
-            echo "Market closed — scanning crypto only"
-            SHORT_CANDIDATES=""
-            BUY_CANDIDATES=""
+            echo "=== DAILY DRAWDOWN >4% — NO NEW POSITIONS THIS CYCLE ==="
+            exit 0
           fi
 
-          # Always check crypto
           echo ""
-          echo "=== CRYPTO ==="
-          for SYM in X:BTCUSD X:ETHUSD X:SOLUSD X:DOGEUSD; do
-            DATA=$(curl -sS --max-time 15 -H "Authorization: Bearer $API_KEY" "$BASE/data/indicators?symbol=$SYM&indicators=rsi,rsi7,macd,sma20")
-            RSI=$(echo "$DATA" | python3 -c "import json,sys; print(json.load(sys.stdin).get('indicators',{}).get('rsi','N/A'))" 2>/dev/null || echo "N/A")
-            RSI7=$(echo "$DATA" | python3 -c "import json,sys; print(json.load(sys.stdin).get('indicators',{}).get('rsi7','N/A'))" 2>/dev/null || echo "N/A")
-            echo "$SYM RSI=$RSI RSI7=$RSI7"
-            if [ "$RSI" != "N/A" ]; then
-              IS_OB=$(python3 -c "print('yes' if float('$RSI') > 70 else 'no')")
-              IS_OS=$(python3 -c "print('yes' if float('$RSI') < 35 else 'no')")
-              if [ "$IS_OB" = "yes" ]; then
-                SHORT_CANDIDATES="$SHORT_CANDIDATES
-          $SYM"
-              elif [ "$IS_OS" = "yes" ]; then
-                BUY_CANDIDATES="$BUY_CANDIDATES
-          $SYM"
-              fi
+          echo "=== SCANNING FOR SETUPS ==="
+
+          # Count current positions — max 5-6
+          POS_COUNT=$(echo "$BALANCE" | python3 -c "import json,sys; print(len(json.load(sys.stdin).get('positions', [])))")
+          echo "Open positions: $POS_COUNT"
+          if [ "$POS_COUNT" -ge 5 ]; then
+            echo "At max positions (5). No new entries."
+            exit 0
+          fi
+
+          # Check cash — keep >=20% as dry powder
+          MIN_CASH=$(python3 -c "print(float('$EQUITY') * 0.20)")
+          CASH_OK=$(python3 -c "print('yes' if float('$CASH') > float('$MIN_CASH') * 1.1 else 'no')")
+          if [ "$CASH_OK" = "no" ]; then
+            echo "Cash below 20% floor ($CASH). No new positions."
+            exit 0
+          fi
+
+          # Momentum scan: price > SMA50, MACD positive, volume > 1.5x avg
+          MOMENTUM=$(curl -sS --max-time 15 -H "Authorization: Bearer $API_KEY" "$BASE/data/scan?preset=momentum&limit=20")
+          echo "Momentum scan: $MOMENTUM"
+
+          # Extract top candidates (exclude crypto)
+          CANDIDATES=$(echo "$MOMENTUM" | python3 -c "
+          import json, sys
+          d = json.load(sys.stdin)
+          matches = d.get('matches', [])
+          stocks = [m['symbol'] for m in matches if not m['symbol'].startswith('X:')]
+          print('\n'.join(stocks[:5]))
+          " 2>/dev/null || true)
+
+          echo "Candidates: $CANDIDATES"
+
+          echo ""
+          echo "=== EVALUATING CANDIDATES ==="
+
+          echo "$CANDIDATES" | while read -r SYM; do
+            [ -z "$SYM" ] && continue
+
+            echo "--- $SYM ---"
+
+            # Get indicators: RSI, SMA20, SMA50, volume
+            IND=$(curl -sS --max-time 15 -H "Authorization: Bearer $API_KEY" \
+              "$BASE/data/indicators?symbol=$SYM&indicators=rsi,sma20,sma50,volume,volumeAvg20,macd")
+
+            RSI=$(echo "$IND" | python3 -c "import json,sys; print(json.load(sys.stdin).get('indicators',{}).get('rsi',0))" 2>/dev/null || echo "0")
+            SMA20=$(echo "$IND" | python3 -c "import json,sys; print(json.load(sys.stdin).get('indicators',{}).get('sma20',0))" 2>/dev/null || echo "0")
+            SMA50=$(echo "$IND" | python3 -c "import json,sys; print(json.load(sys.stdin).get('indicators',{}).get('sma50',0))" 2>/dev/null || echo "0")
+            VOL=$(echo "$IND" | python3 -c "import json,sys; print(json.load(sys.stdin).get('indicators',{}).get('volume',0))" 2>/dev/null || echo "0")
+            VOL_AVG=$(echo "$IND" | python3 -c "import json,sys; print(json.load(sys.stdin).get('indicators',{}).get('volumeAvg20',1))" 2>/dev/null || echo "1")
+            MACD_HIST=$(echo "$IND" | python3 -c "import json,sys; print(json.load(sys.stdin).get('indicators',{}).get('macd',{}).get('histogram',0))" 2>/dev/null || echo "0")
+
+            echo "  RSI=$RSI SMA20=$SMA20 SMA50=$SMA50 MACD_hist=$MACD_HIST"
+
+            # Get current price
+            QUOTE=$(curl -sS --max-time 15 -H "Authorization: Bearer $API_KEY" "$BASE/data/quotes?symbols=$SYM")
+            PRICE=$(echo "$QUOTE" | python3 -c "import json,sys; d=json.load(sys.stdin); print(list(d.get('quotes',{}).values())[0].get('price',0))" 2>/dev/null || echo "0")
+            echo "  Price=$PRICE"
+
+            # Validate ALL entry rules
+            PASS=$(python3 -c "
+          rsi = float('$RSI')
+          sma20 = float('$SMA20')
+          sma50 = float('$SMA50')
+          price = float('$PRICE')
+          vol = float('$VOL')
+          vol_avg = float('$VOL_AVG') or 1
+          macd_hist = float('$MACD_HIST')
+
+          reasons = []
+          ok = True
+
+          # Rule 1: Trend filter
+          if price <= sma50:
+              reasons.append(f'price {price:.2f} below SMA50 {sma50:.2f}')
+              ok = False
+          if sma20 <= sma50:
+              reasons.append(f'SMA20 {sma20:.2f} not above SMA50 {sma50:.2f}')
+              ok = False
+
+          # Rule 2: RSI 50-70
+          if rsi < 50:
+              reasons.append(f'RSI {rsi:.1f} below 50 floor')
+              ok = False
+          if rsi > 75:
+              reasons.append(f'RSI {rsi:.1f} above 75 ceiling — chasing')
+              ok = False
+
+          # Rule 3: MACD positive
+          if macd_hist <= 0:
+              reasons.append(f'MACD histogram {macd_hist:.3f} not positive')
+              ok = False
+
+          # Rule 4: Volume confirmation
+          if vol < vol_avg:
+              reasons.append(f'volume {vol:.0f} below avg {vol_avg:.0f}')
+              ok = False
+
+          if ok:
+              print('PASS')
+          else:
+              print('FAIL: ' + '; '.join(reasons))
+          ")
+
+            echo "  $PASS"
+
+            if [[ "$PASS" == "PASS" ]]; then
+              # Position sizing: risk 8% of equity, stop = 3% below entry (conservative)
+              RISK_AMT=$(python3 -c "print(float('$EQUITY') * 0.08)")
+              STOP_DIST=$(python3 -c "print(float('$PRICE') * 0.03)")
+              QTY=$(python3 -c "q = int(float('$RISK_AMT') / float('$STOP_DIST')); print(max(1, q))")
+
+              # Cap at 20% of equity
+              MAX_QTY=$(python3 -c "print(int(float('$EQUITY') * 0.20 / float('$PRICE')))")
+              QTY=$(python3 -c "print(min(int('$QTY'), int('$MAX_QTY')))")
+
+              STOP_PRICE=$(python3 -c "print(round(float('$PRICE') * 0.97, 2))")
+
+              echo "  -> BUY $QTY shares | stop $STOP_PRICE | risk 8%"
+
+              REASONING="Trend confirmed (price > SMA50, SMA20 > SMA50). RSI $RSI in momentum zone. MACD positive. Volume above avg. Entry $PRICE, stop $STOP_PRICE (~3% below). Risk ~8% of equity."
+
+              curl -sS --max-time 15 \
+                -X POST \
+                -H "Authorization: Bearer $API_KEY" \
+                -H "Content-Type: application/json" \
+                -d "{\"symbol\":\"$SYM\",\"action\":\"buy\",\"qty\":$QTY,\"reasoning\":\"$REASONING\"}" \
+                "$BASE/bots/$BOT_ID/trades"
+              echo ""
+              sleep 1
+
+              # Only enter one new position per cycle
+              break
             fi
           done
 
-          # Execute new trades
           echo ""
-          echo "=== NEW TRADES ==="
-
-          MAX_POS=$(python3 -c "print(int(float('$EQUITY') * 0.10))")
-
-          # Short overbought (Bear Claw's specialty)
-          echo "$SHORT_CANDIDATES" | head -2 | while read -r SYM; do
-            [ -z "$SYM" ] && continue
-            QUOTE=$(curl -sS --max-time 15 -H "Authorization: Bearer $API_KEY" "$BASE/data/quotes?symbols=$SYM")
-            PRICE=$(echo "$QUOTE" | python3 -c "import json,sys; d=json.load(sys.stdin); print(list(d['quotes'].values())[0]['price'])" 2>/dev/null || echo "0")
-            [ "$PRICE" = "0" ] && continue
-            QTY=$(python3 -c "q=int($MAX_POS/float('$PRICE')); print(max(1,q))")
-            INDICATORS=$(curl -sS --max-time 15 -H "Authorization: Bearer $API_KEY" "$BASE/data/indicators?symbol=$SYM&indicators=rsi,rsi7")
-            RSI=$(echo "$INDICATORS" | python3 -c "import json,sys; print(json.load(sys.stdin).get('indicators',{}).get('rsi','?'))" 2>/dev/null || echo "?")
-            echo "SHORT $SYM qty=$QTY price=$PRICE RSI=$RSI"
-            curl -sS --max-time 15 \
-              -H "Authorization: Bearer $API_KEY" \
-              -H "Content-Type: application/json" \
-              -d "{\"symbol\":\"$SYM\",\"action\":\"short\",\"qty\":$QTY,\"reasoning\":\"Overbought at RSI $RSI. Bear Claw fades extended moves.\"}" \
-              "$BASE/bots/$BOT_ID/trades"
-            echo ""
-            sleep 1
-          done
-
-          # Buy oversold
-          echo "$BUY_CANDIDATES" | head -2 | while read -r SYM; do
-            [ -z "$SYM" ] && continue
-            QUOTE=$(curl -sS --max-time 15 -H "Authorization: Bearer $API_KEY" "$BASE/data/quotes?symbols=$SYM")
-            PRICE=$(echo "$QUOTE" | python3 -c "import json,sys; d=json.load(sys.stdin); print(list(d['quotes'].values())[0]['price'])" 2>/dev/null || echo "0")
-            [ "$PRICE" = "0" ] && continue
-            QTY=$(python3 -c "q=int($MAX_POS/float('$PRICE')); print(max(1,q))")
-            INDICATORS=$(curl -sS --max-time 15 -H "Authorization: Bearer $API_KEY" "$BASE/data/indicators?symbol=$SYM&indicators=rsi,rsi7")
-            RSI=$(echo "$INDICATORS" | python3 -c "import json,sys; print(json.load(sys.stdin).get('indicators',{}).get('rsi','?'))" 2>/dev/null || echo "?")
-            echo "BUY $SYM qty=$QTY price=$PRICE RSI=$RSI"
-            curl -sS --max-time 15 \
-              -H "Authorization: Bearer $API_KEY" \
-              -H "Content-Type: application/json" \
-              -d "{\"symbol\":\"$SYM\",\"action\":\"buy\",\"qty\":$QTY,\"reasoning\":\"Oversold at RSI $RSI. Mean reversion buy — even a bear knows when to buy the dip.\"}" \
-              "$BASE/bots/$BOT_ID/trades"
-            echo ""
-            sleep 1
-          done
+          echo "=== FINAL BALANCE ==="
+          curl -sS --max-time 15 -H "Authorization: Bearer $API_KEY" "$BASE/bots/$BOT_ID/balance"
 
           echo ""
           echo "=== SESSION COMPLETE ==="
-          curl -sS --max-time 15 -H "Authorization: Bearer $API_KEY" "$BASE/bots/$BOT_ID/balance"
