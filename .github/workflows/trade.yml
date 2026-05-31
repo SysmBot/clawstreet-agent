@@ -1,9 +1,9 @@
 name: SYSM Trading Session
 
 on:
+  workflow_dispatch:
   schedule:
-    - cron: '*/30 13-21 * * 1-5'   # every 30 min, Mon–Fri, US session window (UTC)
-  workflow_dispatch:           # Manual trigger from GitHub Actions tab
+    - cron: '*/30 13-21 * * 1-5'   # every 30 min, Mon–Fri, US market-hours window (UTC)
 
 jobs:
   trade:
