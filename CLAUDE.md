@@ -48,20 +48,21 @@ If `.env.agent` exists, source the credentials and start a trading session:
 
 ## Universe & How to Use the Scan
 
-The skill file exposes a scan (e.g. a `momentum` preset). Treat the scan as a candidate *generator*, then apply the Entry Rules below as the filter — never trade a scan hit without confirming it passes the rules.
+Use the scan as a candidate *generator*, then verify every hit against the Entry Rules below using the indicators endpoint — never trade a scan hit without confirming it passes all four rules.
 
-- Prefer **liquid large/mid-caps and liquid ETFs** (e.g. SPY/QQQ for index exposure) with tight spreads and high average volume.
-- If the scan supports parameters (preset, sectors, threshold, universe), bias toward this liquid universe. If the scan returns no candidates, that is a valid outcome — **hold cash.** A quiet, low-volatility session producing zero trades is the strategy working, not failing.
-- **Avoid:** illiquid small-caps, names gapping on rumor, anything without a clean definable stop, and earnings-day lottery tickets.
+- **Generate candidates:** `GET /api/data/scan?preset=momentum`. The `momentum` preset already pre-filters to price > SMA50, MACD positive, and volume > ~1.5x average — which overlaps our trend and volume requirements. Its thresholds aren't tunable, so it's a generator, not the final filter.
+- **Keep it to liquid names:** the preset scans broadly, so bias toward **liquid large/mid-caps and liquid ETFs** (e.g. SPY/QQQ) by passing a curated universe via `&symbols=AAPL,MSFT,NVDA,...`, or narrow with `&sector=Tech,Finance,...`. Avoid illiquid small-caps, rumor gappers, anything without a clean definable stop, and earnings-day lottery tickets.
+- **Verify each candidate:** call `GET /api/data/indicators?symbol=X&indicators=rsi,sma20,sma50,volume,volumeAvg20` (and `GET /api/data/history?symbol=X` for the trigger) and apply the Entry Rules. Only trade what passes.
+- **No candidates is a valid outcome — hold cash.** A quiet, low-volatility session producing zero trades is the strategy working, not failing.
 
 ## Entry Rules (all must align — confirmation, not prediction)
 
-Enter LONG only when all of these agree on a candidate:
+Enter LONG only when all of these agree on a candidate (check via `GET /api/data/indicators` and `GET /api/data/history`):
 
-1. **Trend filter:** Price above the 50-day MA AND 20 MA > 50 MA. Trade with the trend only; never catch a falling knife.
-2. **Momentum:** RSI(14) between 50 and 70 — rising but not overextended. Skip if RSI > 75 (chasing) or < 45 (no momentum).
-3. **Trigger:** A clean breakout above recent resistance, OR a pullback that holds the 20 MA and resumes upward.
-4. **Volume confirmation:** Entry-day volume at or above the recent average.
+1. **Trend filter:** current price > `sma50` AND `sma20` > `sma50`. Trade with the trend only; never catch a falling knife.
+2. **Momentum:** `rsi` (14-period) between 50 and 70 — rising but not overextended. Skip if `rsi` > 75 (chasing) or < 45 (no momentum).
+3. **Trigger:** from `history` bars — a clean breakout above recent resistance (above the recent `high[]` range), OR a pullback that held `sma20` and is resuming upward. `distance_from_sma50` and `bb_position` help gauge this.
+4. **Volume confirmation:** `volume` at or above `volumeAvg20` (equivalently `volume_ratio` ≥ 1).
 
 If the signals conflict, **do nothing.** Cash is a position. Missing a trade costs nothing; a bad trade costs capital and standing.
 
@@ -79,10 +80,10 @@ Size by risk, not gut feel. This is the core of "conservative but competitive."
 
 ## Exit Rules — Cut Losers, Ride Winners (the asymmetry)
 
-**Protective stop (mandatory on every entry):**
-- Determine the stop level just below structure (recent swing low, or below the 20 MA) *before* entering.
-- **If the skill file supports resting stop or bracket orders, place the protective stop at entry.** This is strongly preferred — it protects the position even between cycles and overnight.
-- **If only market/limit orders are supported,** record the stop level and check it every cycle: if price has traded through the stop, exit immediately at market. Because cycles are spaced and the agent does not run overnight, also: (a) size assuming realized loss may slightly exceed the nominal stop, and (b) flatten or tighten higher-risk positions before the close to limit naked overnight gap exposure.
+**Protective stop (mandatory on every entry) — agent-enforced, because the platform has NO server-side stops.** ClawStreet only supports immediate market `buy`/`sell`/`short`/`cover`; there is no resting stop, bracket, or trailing order. So the agent IS the stop:
+- At entry, determine the stop level just below structure (recent swing low, or below `sma20`) and record it, along with its implied % loss from entry.
+- **On every cycle:** call `GET /api/bots/{bot_id}/balance`, and for each position check current price (or `unrealized_pl_pct`) against its recorded stop. If price has traded through the stop level, immediately `POST` a `sell`/`cover` at market. No exceptions, no waiting for confirmation.
+- **Because the stop only fires when the agent runs, protection is only as good as the cadence.** Three consequences: (a) the in-session schedule must stay frequent (every ~30 min) — this is a hard requirement, not a nicety; (b) size assuming realized loss can exceed the nominal stop, since price can move between cycles; (c) the agent does not run overnight or on weekends, so positions held through the close have **zero** gap protection — trim or flatten weaker and higher-risk positions before the close, and only hold winners overnight once they've been trailed to breakeven or better.
 - Never widen a stop, never move it down, never average down into a loser. Ever.
 
 **Letting winners run (where the edge comes from):**
@@ -143,4 +144,3 @@ Every trade posts publicly. State the setup (trend + momentum + trigger), the en
 - Never trades a setup where the signals disagree.
 - Never trades crypto or outside US market hours.
 - Never lets a single position exceed 20% of equity in normal operation (up to 50% only under the Endgame Exception).
-
