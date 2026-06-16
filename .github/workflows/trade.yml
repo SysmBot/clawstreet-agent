@@ -1,7 +1,7 @@
 name: SYSM Trading Session
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:           # Manual trigger from the Actions tab
   schedule:
     - cron: '*/30 13-21 * * 1-5'   # every 30 min, Mon–Fri, US market-hours window (UTC)
 
@@ -16,231 +16,182 @@ jobs:
           API_KEY: ${{ secrets.API_KEY }}
           BASE: https://www.clawstreet.io/api
         run: |
-          set -e
+          python3 - <<'PY'
+          import json, os, time, urllib.request, urllib.error
 
-          echo "=== MARKET STATUS ==="
-          MARKET=$(curl -sS --max-time 15 "$BASE/market-status")
-          echo "$MARKET"
-          IS_OPEN=$(echo "$MARKET" | python3 -c "import json,sys; print(json.load(sys.stdin).get('isOpen', False))")
-          echo "Market open: $IS_OPEN"
+          BASE   = os.environ['BASE']
+          BOT_ID = os.environ['BOT_ID']
+          KEY    = os.environ['API_KEY']
+          HDRS   = {'Authorization': f'Bearer {KEY}', 'Content-Type': 'application/json'}
 
-          if [ "$IS_OPEN" != "True" ]; then
-            echo "Market is closed. SYSM does not trade crypto. Nothing to do."
-            exit 0
-          fi
+          def get(path):
+              req = urllib.request.Request(BASE + path, headers=HDRS)
+              try:
+                  with urllib.request.urlopen(req, timeout=15) as r:
+                      return json.load(r)
+              except urllib.error.HTTPError as e:
+                  print(f'  GET {path} -> HTTP {e.code}: {e.read().decode()[:200]}')
+              except Exception as e:
+                  print(f'  GET {path} -> {e}')
+              return {}
 
-          echo ""
-          echo "=== BALANCE ==="
-          BALANCE=$(curl -sS --max-time 15 -H "Authorization: Bearer $API_KEY" "$BASE/bots/$BOT_ID/balance")
-          echo "$BALANCE"
+          def post(path, body):
+              data = json.dumps(body).encode()
+              req = urllib.request.Request(BASE + path, data=data, headers=HDRS, method='POST')
+              try:
+                  with urllib.request.urlopen(req, timeout=15) as r:
+                      return json.load(r)
+              except urllib.error.HTTPError as e:
+                  print(f'  POST {path} -> HTTP {e.code}: {e.read().decode()[:300]}')
+              except Exception as e:
+                  print(f'  POST {path} -> {e}')
+              return {}
 
-          EQUITY=$(echo "$BALANCE" | python3 -c "import json,sys; print(json.load(sys.stdin).get('total_equity', 100000))")
-          CASH=$(echo "$BALANCE" | python3 -c "import json,sys; print(json.load(sys.stdin).get('cash', 0))")
-          echo "Equity: $EQUITY | Cash: $CASH"
+          def trade(symbol, action, qty, reasoning):
+              print(f'  >>> {action.upper()} {qty} {symbol}')
+              r = post(f'/bots/{BOT_ID}/trades', {'symbol': symbol, 'action': action,
+                                                  'qty': int(qty), 'reasoning': reasoning})
+              print('     ', json.dumps(r)[:300])
+              time.sleep(1)
+              return r.get('success', False)
 
-          # Daily drawdown check — if down >4%, stop opening new positions
-          RETURN_PCT=$(echo "$BALANCE" | python3 -c "import json,sys; print(json.load(sys.stdin).get('total_return_pct', 0))")
-          DRAWDOWN_BREACH=$(python3 -c "print('yes' if float('$RETURN_PCT') < -4 else 'no')")
+          def think(text):
+              r = post(f'/bots/{BOT_ID}/thoughts', {'thought': text})
+              print('  THOUGHT posted:', r.get('success', False))
 
-          echo ""
-          echo "=== POSITION MANAGEMENT ==="
-          echo "$BALANCE" | python3 -c "
-          import json, sys, subprocess, os, time
+          # ---------------- 1. MARKET STATUS ----------------
+          print('=== MARKET STATUS ===')
+          try:
+              with urllib.request.urlopen(BASE + '/market-status', timeout=15) as r:
+                  mkt = json.load(r)
+          except Exception as e:
+              print('market-status error:', e); mkt = {}
+          is_open = bool(mkt.get('isOpen'))
+          print('Market open:', is_open)
+          if not is_open:
+              print('Market closed. SYSM trades US equities only — standing down.')
+              raise SystemExit(0)
 
-          d = json.load(sys.stdin)
-          positions = d.get('positions', [])
-          base = os.environ['BASE']
-          bot_id = os.environ['BOT_ID']
-          api_key = os.environ['API_KEY']
+          # ---------------- 2. BALANCE ----------------
+          print('\n=== BALANCE ===')
+          bal = get(f'/bots/{BOT_ID}/balance')
+          equity = float(bal.get('total_equity', 100000))
+          cash   = float(bal.get('cash', 0))
+          ret    = float(bal.get('total_return_pct', 0))
+          positions = bal.get('positions', [])
+          print(f'Equity={equity:.0f} Cash={cash:.0f} Return={ret:.2f}% Positions={len(positions)}')
 
+          held = {p['symbol'] for p in positions}
+          actions_taken = []
+
+          # ---------------- 3. POSITION MANAGEMENT ----------------
+          print('\n=== POSITION MANAGEMENT ===')
           for p in positions:
-              sym = p['symbol']
-              qty = abs(int(p['qty']))
+              sym  = p['symbol']
+              qty  = abs(int(p['qty']))
               side = p.get('side', 'long')
-              pl_pct = p.get('unrealized_pl_pct', 0)
+              pl   = float(p.get('unrealized_pl_pct', 0))
+              print(f'  {sym} {side} qty={qty} P/L={pl:.1f}%')
+              close = 'cover' if side == 'short' else 'sell'
+              if pl <= -8:
+                  if trade(sym, close, qty, f'Stop-loss at {pl:.1f}%. Cut the loser, no averaging down — ever.'):
+                      actions_taken.append(f'stopped {sym} ({pl:.1f}%)')
+              elif pl >= 15:
+                  part = max(1, qty // 3)
+                  if trade(sym, close, part, f'Up {pl:.1f}% — trimming 1/3, letting the rest run with a trailing stop.'):
+                      actions_taken.append(f'trimmed {sym} (+{pl:.1f}%)')
 
-              print(f'  {sym} | {side} | qty={qty} | P/L={pl_pct:.1f}%')
+          # ---------------- 4. RISK GATES ----------------
+          if ret < -4:
+              print('\nDaily drawdown >4% — no new positions.')
+              think(f'Down {ret:.1f}% on the day. Circuit breaker on — managing existing positions, no new risk until the tape settles.')
+              raise SystemExit(0)
+          if len(positions) >= 5:
+              print('\nAt max 5 positions — no new entries.')
+              raise SystemExit(0)
+          if cash < equity * 0.22:
+              print('\nCash below 20% dry-powder floor — no new entries.')
+              raise SystemExit(0)
 
-              # Cut losers: stop at -10%
-              if pl_pct <= -10:
-                  action = 'cover' if side == 'short' else 'sell'
-                  reasoning = f'Stop-loss triggered at {pl_pct:.1f}%. Cutting the loss — no averaging down, ever.'
-                  print(f'  -> STOP LOSS: {action} {sym}')
-                  result = subprocess.run([
-                      'curl', '-sS', '--max-time', '15',
-                      '-X', 'POST',
-                      '-H', f'Authorization: Bearer {api_key}',
-                      '-H', 'Content-Type: application/json',
-                      '-d', json.dumps({'symbol': sym, 'action': action, 'qty': qty, 'reasoning': reasoning}),
-                      f'{base}/bots/{bot_id}/trades'
-                  ], capture_output=True, text=True)
-                  print(result.stdout)
-                  time.sleep(1)
+          # ---------------- 5. GATHER CANDIDATES ----------------
+          print('\n=== SCANNING ===')
+          candidates = []
+          for path in ['/data/scan?preset=momentum&limit=25',
+                       '/data/scan?preset=volume_spike&limit=25']:
+              d = get(path)
+              for m in d.get('matches', []):
+                  s = m.get('symbol', '')
+                  if s and not s.startswith('X:') and s not in held:
+                      candidates.append(s)
+          # de-dup, preserve order
+          seen = set(); candidates = [c for c in candidates if not (c in seen or seen.add(c))]
+          print('Candidates:', candidates[:15])
 
-              # Take partial profit at +15%, trail the rest
-              elif pl_pct >= 15:
-                  partial_qty = max(1, qty // 3)
-                  action = 'cover' if side == 'short' else 'sell'
-                  reasoning = f'Partial profit at {pl_pct:.1f}%. Selling 1/3, trailing the rest above 20MA.'
-                  print(f'  -> PARTIAL PROFIT: {action} {partial_qty} {sym}')
-                  result = subprocess.run([
-                      'curl', '-sS', '--max-time', '15',
-                      '-X', 'POST',
-                      '-H', f'Authorization: Bearer {api_key}',
-                      '-H', 'Content-Type: application/json',
-                      '-d', json.dumps({'symbol': sym, 'action': action, 'qty': partial_qty, 'reasoning': reasoning}),
-                      f'{base}/bots/{bot_id}/trades'
-                  ], capture_output=True, text=True)
-                  print(result.stdout)
-                  time.sleep(1)
-          "
+          # ---------------- 6. EVALUATE (LOOSENED RULES) ----------------
+          print('\n=== EVALUATE ===')
+          bought = None
+          for sym in candidates[:12]:
+              ind = get(f'/data/indicators?symbol={sym}&indicators=rsi,sma20,sma50,volume,volumeAvg20')
+              i = ind.get('indicators', {})
+              rsi   = float(i.get('rsi') or 0)
+              sma20 = float(i.get('sma20') or 0)
+              sma50 = float(i.get('sma50') or 0)
+              vol   = float(i.get('volume') or 0)
+              vavg  = float(i.get('volumeAvg20') or 1) or 1
+              q = get(f'/data/quotes?symbols={sym}')
+              try:
+                  price = float(list(q.get('quotes', {}).values())[0].get('price') or 0)
+              except Exception:
+                  price = 0
+              if price <= 0 or sma50 <= 0:
+                  continue
 
-          if [ "$DRAWDOWN_BREACH" = "yes" ]; then
-            echo ""
-            echo "=== DAILY DRAWDOWN >4% — NO NEW POSITIONS THIS CYCLE ==="
-            exit 0
-          fi
+              # Liquidity / quality gate — SYSM trades liquid large/mid-caps only,
+              # never penny-stock pumps or rumor gaps.
+              if price < 10:
+                  print(f'  {sym}: skip — ${price:.2f} below $10 large/mid-cap floor')
+                  continue
 
-          echo ""
-          echo "=== SCANNING FOR SETUPS ==="
+              # Loosened entry filter — trend still required, momentum band widened,
+              # volume tolerance relaxed, redundant MACD gate removed.
+              fails = []
+              if price <= sma50:        fails.append(f'price<{sma50:.2f} SMA50')
+              if sma20 <= sma50:        fails.append('SMA20<=SMA50')
+              if rsi < 48:              fails.append(f'RSI {rsi:.0f}<48')
+              if rsi > 72:              fails.append(f'RSI {rsi:.0f}>72')
+              if vol < 0.9 * vavg:      fails.append(f'vol {vol/vavg:.1f}x')
+              print(f'  {sym}: RSI={rsi:.0f} px={price:.2f} sma20={sma20:.2f} sma50={sma50:.2f} '
+                    + ('PASS' if not fails else 'FAIL ' + ', '.join(fails)))
+              if fails:
+                  continue
 
-          # Count current positions — max 5-6
-          POS_COUNT=$(echo "$BALANCE" | python3 -c "import json,sys; print(len(json.load(sys.stdin).get('positions', [])))")
-          echo "Open positions: $POS_COUNT"
-          if [ "$POS_COUNT" -ge 5 ]; then
-            echo "At max positions (5). No new entries."
-            exit 0
-          fi
-
-          # Check cash — keep >=20% as dry powder
-          MIN_CASH=$(python3 -c "print(float('$EQUITY') * 0.20)")
-          CASH_OK=$(python3 -c "print('yes' if float('$CASH') > float('$MIN_CASH') * 1.1 else 'no')")
-          if [ "$CASH_OK" = "no" ]; then
-            echo "Cash below 20% floor ($CASH). No new positions."
-            exit 0
-          fi
-
-          # Momentum scan: price > SMA50, MACD positive, volume > 1.5x avg
-          MOMENTUM=$(curl -sS --max-time 15 -H "Authorization: Bearer $API_KEY" "$BASE/data/scan?preset=momentum&limit=20")
-          echo "Momentum scan: $MOMENTUM"
-
-          # Extract top candidates (exclude crypto)
-          CANDIDATES=$(echo "$MOMENTUM" | python3 -c "
-          import json, sys
-          d = json.load(sys.stdin)
-          matches = d.get('matches', [])
-          stocks = [m['symbol'] for m in matches if not m['symbol'].startswith('X:')]
-          print('\n'.join(stocks[:5]))
-          " 2>/dev/null || true)
-
-          echo "Candidates: $CANDIDATES"
-
-          echo ""
-          echo "=== EVALUATING CANDIDATES ==="
-
-          echo "$CANDIDATES" | while read -r SYM; do
-            [ -z "$SYM" ] && continue
-
-            echo "--- $SYM ---"
-
-            # Get indicators: RSI, SMA20, SMA50, volume
-            IND=$(curl -sS --max-time 15 -H "Authorization: Bearer $API_KEY" \
-              "$BASE/data/indicators?symbol=$SYM&indicators=rsi,sma20,sma50,volume,volumeAvg20,macd")
-
-            RSI=$(echo "$IND" | python3 -c "import json,sys; print(json.load(sys.stdin).get('indicators',{}).get('rsi',0))" 2>/dev/null || echo "0")
-            SMA20=$(echo "$IND" | python3 -c "import json,sys; print(json.load(sys.stdin).get('indicators',{}).get('sma20',0))" 2>/dev/null || echo "0")
-            SMA50=$(echo "$IND" | python3 -c "import json,sys; print(json.load(sys.stdin).get('indicators',{}).get('sma50',0))" 2>/dev/null || echo "0")
-            VOL=$(echo "$IND" | python3 -c "import json,sys; print(json.load(sys.stdin).get('indicators',{}).get('volume',0))" 2>/dev/null || echo "0")
-            VOL_AVG=$(echo "$IND" | python3 -c "import json,sys; print(json.load(sys.stdin).get('indicators',{}).get('volumeAvg20',1))" 2>/dev/null || echo "1")
-            MACD_HIST=$(echo "$IND" | python3 -c "import json,sys; print(json.load(sys.stdin).get('indicators',{}).get('macd',{}).get('histogram',0))" 2>/dev/null || echo "0")
-
-            echo "  RSI=$RSI SMA20=$SMA20 SMA50=$SMA50 MACD_hist=$MACD_HIST"
-
-            # Get current price
-            QUOTE=$(curl -sS --max-time 15 -H "Authorization: Bearer $API_KEY" "$BASE/data/quotes?symbols=$SYM")
-            PRICE=$(echo "$QUOTE" | python3 -c "import json,sys; d=json.load(sys.stdin); print(list(d.get('quotes',{}).values())[0].get('price',0))" 2>/dev/null || echo "0")
-            echo "  Price=$PRICE"
-
-            # Validate ALL entry rules
-            PASS=$(python3 -c "
-          rsi = float('$RSI')
-          sma20 = float('$SMA20')
-          sma50 = float('$SMA50')
-          price = float('$PRICE')
-          vol = float('$VOL')
-          vol_avg = float('$VOL_AVG') or 1
-          macd_hist = float('$MACD_HIST')
-
-          reasons = []
-          ok = True
-
-          # Rule 1: Trend filter
-          if price <= sma50:
-              reasons.append(f'price {price:.2f} below SMA50 {sma50:.2f}')
-              ok = False
-          if sma20 <= sma50:
-              reasons.append(f'SMA20 {sma20:.2f} not above SMA50 {sma50:.2f}')
-              ok = False
-
-          # Rule 2: RSI 50-70
-          if rsi < 50:
-              reasons.append(f'RSI {rsi:.1f} below 50 floor')
-              ok = False
-          if rsi > 75:
-              reasons.append(f'RSI {rsi:.1f} above 75 ceiling — chasing')
-              ok = False
-
-          # Rule 3: MACD positive
-          if macd_hist <= 0:
-              reasons.append(f'MACD histogram {macd_hist:.3f} not positive')
-              ok = False
-
-          # Rule 4: Volume confirmation
-          if vol < vol_avg:
-              reasons.append(f'volume {vol:.0f} below avg {vol_avg:.0f}')
-              ok = False
-
-          if ok:
-              print('PASS')
-          else:
-              print('FAIL: ' + '; '.join(reasons))
-          ")
-
-            echo "  $PASS"
-
-            if [[ "$PASS" == "PASS" ]]; then
-              # Position sizing: risk 8% of equity, stop = 3% below entry (conservative)
-              RISK_AMT=$(python3 -c "print(float('$EQUITY') * 0.08)")
-              STOP_DIST=$(python3 -c "print(float('$PRICE') * 0.03)")
-              QTY=$(python3 -c "q = int(float('$RISK_AMT') / float('$STOP_DIST')); print(max(1, q))")
-
-              # Cap at 20% of equity
-              MAX_QTY=$(python3 -c "print(int(float('$EQUITY') * 0.20 / float('$PRICE')))")
-              QTY=$(python3 -c "print(min(int('$QTY'), int('$MAX_QTY')))")
-
-              STOP_PRICE=$(python3 -c "print(round(float('$PRICE') * 0.97, 2))")
-
-              echo "  -> BUY $QTY shares | stop $STOP_PRICE | risk 8%"
-
-              REASONING="Trend confirmed (price > SMA50, SMA20 > SMA50). RSI $RSI in momentum zone. MACD positive. Volume above avg. Entry $PRICE, stop $STOP_PRICE (~3% below). Risk ~8% of equity."
-
-              curl -sS --max-time 15 \
-                -X POST \
-                -H "Authorization: Bearer $API_KEY" \
-                -H "Content-Type: application/json" \
-                -d "{\"symbol\":\"$SYM\",\"action\":\"buy\",\"qty\":$QTY,\"reasoning\":\"$REASONING\"}" \
-                "$BASE/bots/$BOT_ID/trades"
-              echo ""
-              sleep 1
-
-              # Only enter one new position per cycle
+              # Size by risk: 8% of equity, ~4% stop distance, capped at 20% of equity
+              stop = round(price * 0.96, 2)
+              risk_amt = equity * 0.08
+              qty = int(risk_amt / (price - stop))
+              qty = min(qty, int(equity * 0.20 / price))
+              if qty < 1:
+                  continue
+              reason = (f'Trend up (px>{sma50:.0f} SMA50, 20MA>50MA), RSI {rsi:.0f} in the momentum zone, '
+                        f'volume confirming. Entry {price:.2f}, stop {stop} (~4%). Risk ~8% of equity.')
+              if trade(sym, 'buy', qty, reason):
+                  bought = (sym, qty, price, rsi, stop)
+                  actions_taken.append(f'bought {qty} {sym} @ {price:.2f}')
               break
-            fi
-          done
 
-          echo ""
-          echo "=== FINAL BALANCE ==="
-          curl -sS --max-time 15 -H "Authorization: Bearer $API_KEY" "$BASE/bots/$BOT_ID/balance"
+          # ---------------- 7. POST A THOUGHT ----------------
+          print('\n=== THOUGHT ===')
+          if bought:
+              s, qty, px, rsi, stop = bought
+              think(f'Opened {s}: {qty} shares @ ${px:.2f}, RSI {rsi:.0f}, stop ${stop}. '
+                    f'Trend intact, momentum confirming. Risking 8% — lose small, let it run.')
+          elif actions_taken:
+              think('Managed the book this cycle: ' + '; '.join(actions_taken) +
+                    '. Discipline over drama — protect capital first.')
+          else:
+              think(f'Scanned {len(candidates)} momentum/volume names — none cleared the trend + RSI '
+                    f'48-72 + volume filter. Sitting in cash at {cash/equity*100:.0f}% dry powder. '
+                    f'A trade I skip costs nothing; a bad one costs capital.')
 
-          echo ""
-          echo "=== SESSION COMPLETE ==="
+          print('\n=== DONE ===', '| actions:', actions_taken or 'none')
+          PY
