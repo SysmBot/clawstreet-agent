@@ -53,7 +53,10 @@ jobs:
                                                   'qty': int(qty), 'reasoning': reasoning})
               print('     ', json.dumps(r)[:300])
               time.sleep(1)
-              return r.get('success', False)
+              # ORDER_QUEUED means the order was accepted and will fill on the next
+              # cron tick — treat it as placed, not failed.
+              placed = bool(r.get('success')) or r.get('error', {}).get('code') == 'ORDER_QUEUED'
+              return placed
 
           def think(text):
               r = post(f'/bots/{BOT_ID}/thoughts', {'thought': text})
@@ -87,18 +90,48 @@ jobs:
           # ---------------- 3. POSITION MANAGEMENT ----------------
           print('\n=== POSITION MANAGEMENT ===')
           for p in positions:
-              sym  = p['symbol']
-              qty  = abs(int(p['qty']))
-              side = p.get('side', 'long')
-              pl   = float(p.get('unrealized_pl_pct', 0))
-              print(f'  {sym} {side} qty={qty} P/L={pl:.1f}%')
+              sym   = p['symbol']
+              qty   = abs(int(p['qty']))
+              side  = p.get('side', 'long')
+              pl    = float(p.get('unrealized_pl_pct', 0))
+              price = float(p.get('current_price', 0))
               close = 'cover' if side == 'short' else 'sell'
+
+              # Pull the 20-day MA — our trailing-stop reference.
+              pind  = get(f'/data/indicators?symbol={sym}&indicators=sma20')
+              sma20 = float(pind.get('indicators', {}).get('sma20') or 0)
+              print(f'  {sym} {side} qty={qty} P/L={pl:.1f}% price={price:.2f} sma20={sma20:.2f}')
+
+              # Trailing-stop reference: a long loses its trend below the 20MA;
+              # a short loses its trend back above the 20MA.
+              if side == 'long':
+                  broke_trail = sma20 > 0 and price < sma20 * 0.99
+              else:
+                  broke_trail = sma20 > 0 and price > sma20 * 1.01
+
+              # 1. Hard stop — cut losers fast, never widen.
               if pl <= -8:
-                  if trade(sym, close, qty, f'Stop-loss at {pl:.1f}%. Cut the loser, no averaging down — ever.'):
+                  if trade(sym, close, qty, f'Stop-loss at {pl:.1f}%. Cut the loser — no averaging down, ever.'):
                       actions_taken.append(f'stopped {sym} ({pl:.1f}%)')
+
+              # 2. TRAILING STOP — in profit and the 20MA broke? Exit the WHOLE position
+              #    and bank it. The structural gain-lock for trending names.
+              elif pl >= 4 and broke_trail:
+                  if trade(sym, close, qty, f'Trailing stop: lost the 20MA while +{pl:.1f}%. '
+                                            f'Banking the win — never hand a winner all the way back.'):
+                      actions_taken.append(f'trailed out {sym} (+{pl:.1f}%)')
+
+              # 3. RATCHET PROFIT-TAKING — banks gains on extended winners even when the
+              #    20MA lags far below entry (fast spikes). Scales out as the gain grows.
+              elif pl >= 25:
+                  part = max(1, qty // 2)
+                  if trade(sym, close, part, f'Up {pl:.1f}% — taking half off to lock the gain. '
+                                             f'Letting the rest trail under the 20MA.'):
+                      actions_taken.append(f'banked half {sym} (+{pl:.1f}%)')
               elif pl >= 15:
                   part = max(1, qty // 3)
-                  if trade(sym, close, part, f'Up {pl:.1f}% — trimming 1/3, letting the rest run with a trailing stop.'):
+                  if trade(sym, close, part, f'Up {pl:.1f}% — trimming 1/3 to bank the gain, '
+                                             f'rest trails the 20MA. Realize strength, never round-trip it.'):
                       actions_taken.append(f'trimmed {sym} (+{pl:.1f}%)')
 
           # ---------------- 4. RISK GATES ----------------
